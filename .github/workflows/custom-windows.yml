@@ -99,7 +99,7 @@ jobs:
           $pp = 'res/msi/preprocess.py'
           $appNameLine = '        "--app-name", type=str, default="RustDesk", help="The app name."'
           $exeNameLine = '        "--exe-name", type=str, default="", help="The executable file name without extension."'
-          Set-Exact $pp $appNameLine ($appNameLine + "`n" + $exeNameLine)
+          Set-Exact $pp $appNameLine ($appNameLine + "," + "`n" + $exeNameLine)
           Set-Exact $pp 'g_version = ""' ('g_version = ""' + "`n" + 'g_exe_name = ""')
           Set-Exact $pp '    app_name = args.app_name' ('    app_name = args.app_name' + "`n" + '    g_exe_name = args.exe_name or app_name')
           Set-Exact $pp '    dist_app = dist_dir.joinpath(app_name + ".exe")' '    dist_app = dist_dir.joinpath(g_exe_name + ".exe")'
@@ -265,10 +265,14 @@ jobs:
 
       - name: Build msi
         run: |
+          $ErrorActionPreference = 'Stop'
           pushd ./res/msi
           python preprocess.py --arp -d ../../rustdesk --app-name "${{ env.APP_NAME_CN }}" --exe-name "${{ env.EXE_NAME }}"
+          if ($LASTEXITCODE -ne 0) { throw "preprocess failed with $LASTEXITCODE" }
           nuget restore msi.sln
+          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed with $LASTEXITCODE" }
           msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with $LASTEXITCODE" }
           $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
           mv $msi.FullName "../../SignOutput/${{ env.APP_NAME_CN }}-${{ env.VERSION }}-x64.msi"
           popd
