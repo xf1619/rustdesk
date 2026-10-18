@@ -119,6 +119,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          python -m pip install --quiet --disable-pip-version-check pillow
           python .github/scripts/gen_icon.py icon-out
           Copy-Item icon-out/icon.ico              res/icon.ico -Force
           Copy-Item icon-out/icon.png              res/icon.png -Force
