@@ -184,6 +184,7 @@ jobs:
           doNotCache: false
 
       - name: Install vcpkg dependencies
+        shell: bash
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
         run: |
