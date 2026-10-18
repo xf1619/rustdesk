@@ -1,0 +1,278 @@
+name: Custom Windows Build (远程桌面)
+
+# 定制 Windows x64 客户端：内置自建 RustDesk 服务器参数、应用名「远程桌面」、替换图标。
+# 触发方式：Actions -> 左侧 "Custom Windows Build (远程桌面)" -> Run workflow。
+
+on:
+  workflow_dispatch:
+
+env:
+  VERSION: "1.5.1"
+  FLUTTER_VERSION: "3.24.5"
+  LLVM_VERSION: "15.0.6"
+  RUST_VERSION: "1.75"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # ===== 定制参数：以后改这里即可 =====
+  SERVER_HOST: "xdma.qingdao58.cn"
+  SERVER_KEY: "p72fv+xx8ZSa298Az84cZdHfT+ts1fb6QmgQUYSHumE="
+  APP_NAME_CN: "远程桌面"
+  EXE_NAME: "RemoteDesktop"
+
+jobs:
+  bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  topmost:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  windows:
+    name: windows-x64
+    needs: [bridge, topmost]
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply custom patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Set-Exact {
+            param([string]$Path, [string]$Old, [string]$New, [int]$Count = 1)
+            $text = [System.IO.File]::ReadAllText($Path)
+            $actual = ([regex]::Matches($text, [regex]::Escape($Old))).Count
+            if ($actual -ne $Count) {
+              throw "PATCH ANCHOR MISS in ${Path}: found $actual, expected $Count`n--- anchor ---`n$Old"
+            }
+            $text = $text.Replace($Old, $New)
+            [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "patched: $Path"
+          }
+
+          $srv = $env:SERVER_HOST
+          $key = $env:SERVER_KEY
+          $app = $env:APP_NAME_CN
+
+          # 1) 服务器地址 / 公钥 / 应用名
+          $cfg = 'libs/hbb_common/src/config.rs'
+          Set-Exact $cfg 'pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];' ('pub const RENDEZVOUS_SERVERS: &[&str] = &["' + $srv + '"];')
+          Set-Exact $cfg 'pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";' ('pub const RS_PUB_KEY: &str = "' + $key + '";')
+          Set-Exact $cfg 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());' ('pub static ref APP_NAME: RwLock<String> = RwLock::new("' + $app + '".to_owned());')
+
+          # 2) 用 OVERWRITE_SETTINGS 写死服务器参数（界面可见但不可改）
+          $oldOverwrite = 'pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();'
+          $newOverwrite = @(
+            'pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new({',
+            '        let mut m = HashMap::new();',
+            ('        m.insert("custom-rendezvous-server".to_owned(), "' + $srv + '".to_owned());'),
+            ('        m.insert("relay-server".to_owned(), "' + $srv + '".to_owned());'),
+            ('        m.insert("key".to_owned(), "' + $key + '".to_owned());'),
+            '        m.insert("api-server".to_owned(), "".to_owned());',
+            '        m',
+            '    });'
+          ) -join "`n"
+          Set-Exact $cfg $oldOverwrite $newOverwrite
+
+          # 3) 版本资源：产品名/文件描述
+          $rc = 'flutter/windows/runner/Runner.rc'
+          Set-Exact $rc 'VALUE "FileDescription", "RustDesk Remote Desktop" "\0"' ('VALUE "FileDescription", "' + $app + '" "\0"')
+          Set-Exact $rc 'VALUE "ProductName", "RustDesk" "\0"' ('VALUE "ProductName", "' + $app + '" "\0"')
+
+          # 4) MSI 预处理：产品显示名与 exe 文件名解耦
+          $pp = 'res/msi/preprocess.py'
+          $appNameLine = '        "--app-name", type=str, default="RustDesk", help="The app name."'
+          $exeNameLine = '        "--exe-name", type=str, default="", help="The executable file name without extension."'
+          Set-Exact $pp $appNameLine ($appNameLine + "`n" + $exeNameLine)
+          Set-Exact $pp 'g_version = ""' ('g_version = ""' + "`n" + 'g_exe_name = ""')
+          Set-Exact $pp '    app_name = args.app_name' ('    app_name = args.app_name' + "`n" + '    g_exe_name = args.exe_name or app_name')
+          Set-Exact $pp '    dist_app = dist_dir.joinpath(app_name + ".exe")' '    dist_app = dist_dir.joinpath(g_exe_name + ".exe")'
+          Set-Exact $pp 'if file_path.name.lower() == f"{app_name}.exe".lower():' 'if file_path.name.lower() == f"{g_exe_name}.exe".lower():'
+          $productDefine = '            f''{indent}<?define Product="{args.app_name}" ?>\n'','
+          $exeDefine = '            f''{indent}<?define ExeName="{g_exe_name}" ?>\n'','
+          Set-Exact $pp $productDefine ($productDefine + "`n" + $exeDefine)
+
+          # wxs 里 $(var.Product).exe 同时用于 File 名、防火墙规则、服务启动参数、进程终止，
+          # 全部换成 ExeName；$(var.Product)（不带 .exe）仍作为服务名/产品名。
+          $wxs = 'res/msi/Package/Components/RustDesk.wxs'
+          Set-Exact $wxs '$(var.Product).exe' '$(var.ExeName).exe' 5
+
+          Write-Host 'All patches applied.'
+
+      - name: Generate icons
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .github/scripts/gen_icon.py icon-out
+          Copy-Item icon-out/icon.ico              res/icon.ico -Force
+          Copy-Item icon-out/icon.png              res/icon.png -Force
+          Copy-Item icon-out/32x32.png             res/32x32.png -Force
+          Copy-Item icon-out/64x64.png             res/64x64.png -Force
+          Copy-Item icon-out/128x128.png           res/128x128.png -Force
+          Copy-Item icon-out/128x128@2x.png        res/128x128@2x.png -Force
+          Copy-Item icon-out/tray-icon.ico         res/tray-icon.ico -Force
+          Copy-Item icon-out/app_icon.ico          flutter/windows/runner/resources/app_icon.ico -Force
+          Write-Host 'icons replaced.'
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/* C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-x64-custom
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: Build rustdesk
+        run: |
+          python .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+          Rename-Item ./rustdesk/rustdesk.exe ${{ env.EXE_NAME }}.exe
+
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+            mkdir ./rustdesk/drivers
+            mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+            Expand-Archive printer_driver_adapter.zip -DestinationPath .
+            mv -Force .\printer_driver_adapter.dll ./rustdesk
+          } catch {
+            Write-Host "Ignore the printer driver error."
+          }
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            cp $runner_res ./libs/portable/Runner.res;
+            ls -l ./libs/portable/Runner.res;
+          fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: Upload unsigned app dir
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-custom-windows-x64-dir
+          path: rustdesk
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/${{ env.EXE_NAME }}.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/${{ env.APP_NAME_CN }}-${{ env.VERSION }}-x64.exe"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+        with:
+          msbuild-architecture: x86
+
+      - name: Build msi
+        run: |
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../rustdesk --app-name "${{ env.APP_NAME_CN }}" --exe-name "${{ env.EXE_NAME }}"
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          mv $msi.FullName "../../SignOutput/${{ env.APP_NAME_CN }}-${{ env.VERSION }}-x64.msi"
+          popd
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-custom-windows-x64-installer
+          path: SignOutput/*
