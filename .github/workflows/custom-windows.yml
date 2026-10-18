@@ -126,6 +126,13 @@ jobs:
           $wxs = 'res/msi/Package/Components/RustDesk.wxs'
           Set-Exact $wxs '$(var.Product).exe' '$(var.ExeName).exe' 5
 
+          # 5) MSI 数据库代码页：默认 1252 装不下中文产品名，改成 936(GBK)
+          $pkgWxs = 'res/msi/Package/Package.wxs'
+          Set-Exact $pkgWxs 'Scope="perMachine">' 'Scope="perMachine" Codepage="936">'
+          $wxl = 'res/msi/Package/Language/Package.en-us.wxl'
+          Set-Exact $wxl 'Codepage="1252"' 'Codepage="936"'
+          Set-Exact $wxl '<String Id="SummaryCodepage" Value="1252" />' '<String Id="SummaryCodepage" Value="936" />'
+
           Write-Host 'All patches applied.'
 
       - name: Generate icons
