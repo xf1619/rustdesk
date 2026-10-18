@@ -57,6 +57,8 @@ jobs:
           function Set-Exact {
             param([string]$Path, [string]$Old, [string]$New, [int]$Count = 1)
             $text = [System.IO.File]::ReadAllText($Path)
+            # 统一成 LF，避免 Windows checkout 的 CRLF 让多行锚点匹配不到
+            $text = $text.Replace("`r`n", "`n")
             $actual = ([regex]::Matches($text, [regex]::Escape($Old))).Count
             if ($actual -ne $Count) {
               throw "PATCH ANCHOR MISS in ${Path}: found $actual, expected $Count`n--- anchor ---`n$Old"
